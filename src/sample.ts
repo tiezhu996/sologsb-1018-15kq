@@ -1,4 +1,4 @@
-import type { PracticeProject } from './types'
+import type { PracticeProject, PracticeVersion } from './types'
 
 export function createSampleProject(): PracticeProject {
   const groups = [
@@ -7,13 +7,15 @@ export function createSampleProject(): PracticeProject {
     { id: 'group-3', text: '也吹动了她手里的信', stressWords: ['她', '信'], stressLevel: 3 as const, pauseMs: 520, intonation: 'rise-fall' as const, note: '“她”后稍停，句尾自然下落。' },
     { id: 'group-4', text: '像一句迟到了很多年的回答', stressWords: ['很多年', '回答'], stressLevel: 3 as const, pauseMs: 300, intonation: 'fall-rise' as const, note: '最后形成回味，不要突然拔高。' }
   ]
-  return {
-    title: '电影独白 · 海风与回信',
+  const seededVersion: PracticeVersion = {
+    id: 'version-seed',
+    number: 1,
+    label: '版本 1 · 原文',
+    note: '示例初始版本，两轮尝试都按本意群回看。',
+    createdAt: new Date(Date.now() - 90000000).toISOString(),
+    forkedFromId: null,
+    frozen: true,
     sentence: '清晨的海风，掠过旧码头，也吹动了她手里的信，像一句迟到了很多年的回答。',
-    translation: 'The morning sea breeze swept over the old pier and stirred the letter in her hand, like an answer many years late.',
-    teacher: '陈老师',
-    targetAttempts: 5,
-    targetDuration: 12.5,
     groups,
     attempts: [
       {
@@ -56,7 +58,28 @@ export function createSampleProject(): PracticeProject {
         ],
         selfNote: '第二意群衔接自然了。'
       }
-    ],
+    ]
+  }
+  const draftVersion: PracticeVersion = {
+    id: 'version-draft',
+    number: 2,
+    label: '版本 2 · 当前草稿',
+    note: '',
+    createdAt: new Date().toISOString(),
+    forkedFromId: seededVersion.id,
+    frozen: false,
+    sentence: seededVersion.sentence,
+    groups: structuredClone(groups),
+    attempts: []
+  }
+  return {
+    title: '电影独白 · 海风与回信',
+    translation: 'The morning sea breeze swept over the old pier and stirred the letter in her hand, like an answer many years late.',
+    teacher: '陈老师',
+    targetAttempts: 5,
+    targetDuration: 12.5,
+    versions: [seededVersion, draftVersion],
+    currentVersionId: draftVersion.id,
     errorCategories: ['声调', '韵尾', '重音位置', '连读', '气息', '语速'],
     updatedAt: new Date().toISOString()
   }

@@ -52,20 +52,37 @@ export interface Attempt {
   selfNote: string
 }
 
+/**
+ * 一个练习版本保存当时的句子、意群顺序与全部尝试。
+ * 仅当前草稿（currentVersionId 指向、frozen=false）可以编辑与录音；
+ * 历史版本冻结后只读，旧尝试始终按该版本的意群文本与顺序回看。
+ */
+export interface PracticeVersion {
+  id: string
+  number: number
+  label: string
+  note: string
+  createdAt: string
+  forkedFromId: string | null
+  frozen: boolean
+  sentence: string
+  groups: SenseGroup[]
+  attempts: Attempt[]
+}
+
 export interface PracticeProject {
   title: string
-  sentence: string
   translation: string
   teacher: string
   targetAttempts: number
   targetDuration: number
-  groups: SenseGroup[]
-  attempts: Attempt[]
+  versions: PracticeVersion[]
+  currentVersionId: string
   errorCategories: string[]
   updatedAt: string
 }
 
 export interface PersistedPractice {
   project: PracticeProject
-  version: 1
+  version: 2
 }

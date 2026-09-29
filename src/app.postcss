@@ -127,6 +127,37 @@ h2 { margin: 3px 0 0; font-size: 19px; font-weight: 800; letter-spacing: -.02em;
 .category-list > div { display: grid; grid-template-columns: 90px 1fr 30px; align-items: center; gap: 10px; font-size: 12px; }
 .mini-bar { height: 9px; overflow: hidden; border-radius: 9px; background: #dfe7eb; }
 .mini-bar i { display: block; height: 100%; border-radius: 9px; background: linear-gradient(90deg, #2b8693, #73b5b8); }
+.draft-tip { margin-bottom: 12px; padding: 9px 11px; border-left: 3px solid #2b8693; border-radius: 0 9px 9px 0; color: #4f6470; background: #eef6f7; font-size: 11px; line-height: 1.6; }
+.version-meta { display: grid; gap: 4px; padding: 10px 11px; margin-bottom: 10px; border-radius: 9px; background: #f4f7f9; }
+.version-meta strong { font-size: 13px; color: #1d4f5a; }
+.version-meta small { color: #84939e; font-size: 10px; }
+.version-meta p { margin: 2px 0 0; color: #667684; font-size: 11px; line-height: 1.55; }
+.readonly-banner { display: grid; gap: 8px; padding: 10px 11px; border: 1px dashed #c6a05c; border-radius: 9px; background: #fbf3e2; }
+.readonly-banner span { color: #7c5a23; font-size: 11px; line-height: 1.55; }
+.group-strip-card { display: grid; gap: 9px; }
+.review-group-strip { display: flex; flex-wrap: wrap; gap: 6px; }
+.review-group-strip button { display: inline-flex; align-items: center; gap: 5px; max-width: 100%; padding: 6px 10px; border: 1px solid #d2dde3; border-radius: 999px; color: #465866; background: #f6f9fa; font-size: 11px; cursor: pointer; transition: .15s; }
+.review-group-strip button i { width: 17px; height: 17px; display: inline-grid; place-items: center; border-radius: 50%; background: #cfdde2; color: #3d525e; font-size: 10px; font-style: normal; font-weight: 800; }
+.review-group-strip button:hover { border-color: #9fc1c8; }
+.review-group-strip button.active { border-color: #278695; background: #e6f3f5; color: #17606b; font-weight: 700; }
+.review-group-strip button.active i { background: #278695; color: #fff; }
+.inline-readonly { margin-bottom: 10px; padding: 6px 9px; border-radius: 7px; color: #8a6420; background: #fbf2de; font-size: 10px; }
+.disabled-control { opacity: .62; }
+.disabled-control input { cursor: not-allowed; }
+.version-history, .category-block { margin-top: 22px; }
+.table-heading { margin-bottom: 10px; }
+.table-heading h3 { margin: 2px 0 0; font-size: 15px; font-weight: 800; }
+.version-table { display: grid; gap: 7px; }
+.version-row { display: grid; grid-template-columns: minmax(120px, 1.25fr) 2fr 128px 64px 76px minmax(150px, 1fr); gap: 10px; align-items: center; padding: 10px 12px; border: 1px solid #e0e7eb; border-radius: 10px; background: #f9fbfc; font-size: 12px; }
+.version-row-head { padding: 6px 12px; border: 0; background: #eef3f6; color: #6a7a87; font-size: 10px; font-weight: 800; letter-spacing: .06em; }
+.cell-name { display: grid; gap: 3px; }
+.cell-name small { color: #84939e; font-size: 10px; }
+.cell-note { color: #5f707d; font-size: 11px; line-height: 1.5; }
+.cell-time { color: #71808e; font-size: 11px; line-height: 1.5; }
+.cell-time small { color: #93a1ac; }
+.cell-num { font-size: 16px; font-weight: 820; color: #17606b; text-align: center; }
+.cell-actions { display: flex; flex-wrap: wrap; gap: 6px; }
+.progress-dashboard .category-block .category-list { margin-top: 8px; }
 .loading-overlay { position: fixed; inset: 0; z-index: 100; display: grid; place-items: center; background: rgba(237,241,245,.82); backdrop-filter: blur(8px); }
 .loading-bar { padding: 12px 18px; border-radius: 10px; color: #fff; background: #17606b; }
 @keyframes pulse { 50% { opacity: .35; } }
@@ -159,6 +190,10 @@ h2 { margin: 3px 0 0; font-size: 19px; font-weight: 800; letter-spacing: -.02em;
   .recorder-card { position: static; }
   .progress-dashboard { display: block; }
   .progress-grid { grid-template-columns: 1fr 1fr; }
+  .version-row-head { display: none; }
+  .version-row { grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; }
+  .cell-name, .cell-note, .cell-actions { grid-column: 1 / -1; }
+  .cell-time { text-align: left; }
 }
 @media (max-width: 520px) {
   .brand-block span { display: none; }
