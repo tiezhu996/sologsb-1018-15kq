@@ -1,4 +1,10 @@
-import type { PersistedPractice, PracticeProject } from './types'
+import { normalizeLegacy } from './migrate'
+import type { PersistedPractice, PersistedPracticeV2, PracticeProject } from './types'
+
+export interface LoadedPractice {
+  project: PracticeProject
+  migrated: boolean
+}
 
 const DB_NAME = 'sologsb-1018-prosody'
 const STORE = 'practice'
@@ -17,26 +23,36 @@ function openDb(): Promise<IDBDatabase> {
   })
 }
 
-export async function loadPractice(): Promise<PracticeProject | null> {
+/**
+ * 读取本机练习。v1 容器（含旧单份稿）会在读取时无损迁移为版本化项目；
+ * 迁移结果不立即写回，首次保存时自然升级为 v2。
+ */
+export async function loadPractice(): Promise<LoadedPractice | null> {
   try {
     const db = await openDb()
-    const value = await new Promise<PersistedPractice | undefined>((resolve, reject) => {
+    const value = await new Promise<PersistedPractice | PracticeProject | undefined>((resolve, reject) => {
       const transaction = db.transaction(STORE, 'readonly')
       const request = transaction.objectStore(STORE).get(KEY)
-      request.onsuccess = () => resolve(request.result as PersistedPractice | undefined)
+      request.onsuccess = () => resolve(request.result as PersistedPractice | PracticeProject | undefined)
       request.onerror = () => reject(request.error)
     })
     db.close()
-    if (value?.project) return value.project
+    if (value) return normalizeLegacy(value as Parameters<typeof normalizeLegacy>[0])
   } catch {
     const raw = localStorage.getItem(FALLBACK_KEY)
-    if (raw) return JSON.parse(raw) as PracticeProject
+    if (raw) {
+      try {
+        return normalizeLegacy(JSON.parse(raw) as Parameters<typeof normalizeLegacy>[0])
+      } catch {
+        return null
+      }
+    }
   }
   return null
 }
 
 export async function savePractice(project: PracticeProject): Promise<'indexeddb' | 'localstorage'> {
-  const value: PersistedPractice = { project, version: 1 }
+  const value: PersistedPracticeV2 = { project, version: 2 }
   try {
     const db = await openDb()
     await new Promise<void>((resolve, reject) => {
@@ -48,8 +64,11 @@ export async function savePractice(project: PracticeProject): Promise<'indexeddb
     db.close()
     return 'indexeddb'
   } catch {
-    const fallback = { ...project, attempts: project.attempts.map((attempt) => ({ ...attempt, audioBlob: undefined })) }
-    localStorage.setItem(FALLBACK_KEY, JSON.stringify(fallback))
+    const fallback = {
+      ...project,
+      attempts: project.attempts.map((attempt) => ({ ...attempt, audioBlob: undefined }))
+    }
+    localStorage.setItem(FALLBACK_KEY, JSON.stringify({ project: fallback, version: 2 }))
     return 'localstorage'
   }
 }

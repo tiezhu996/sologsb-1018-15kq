@@ -3,7 +3,8 @@
   import { ProgressBar } from '@skeletonlabs/skeleton'
   import { createSampleProject } from './sample'
   import { clearPractice, loadPractice, savePractice } from './storage'
-  import type { Attempt, Intonation, PracticeProject, SenseGroup, StressLevel } from './types'
+  import type { Attempt, Intonation, PracticeProject, PracticeVersion, SenseGroup, StressLevel } from './types'
+  import { forkForEdit, restoreAsDraft } from './versioning'
 
   const intonationOptions: Array<{ value: Intonation; label: string }> = [
     { value: 'fall', label: '下降 ↘' },
@@ -17,8 +18,10 @@
   let loaded = false
   let saveStatus = '正在读取本机练习…'
   let online = true
-  let selectedGroupId = project.groups[0]?.id ?? ''
+  let selectedGroupId = project.versions[0]?.groups[0]?.id ?? ''
   let selectedAttemptId = project.attempts.at(-1)?.id ?? ''
+  // 回看没有尝试记录的历史版本时，用它固定意群上下文；选了具体尝试则以尝试所属版本为准。
+  let pinnedVersionId: string | null = null
   let workspaceTab: 'annotate' | 'review' | 'progress' = 'annotate'
   let recording = false
   let recordingSeconds = 0
@@ -40,29 +43,86 @@
   let newCategory = ''
   let undoStack: PracticeProject[] = []
   let redoStack: PracticeProject[] = []
-  let selectedGroup: SenseGroup | undefined
-  let selectedAttempt: Attempt | undefined
 
-  $: selectedGroup = project.groups.find((group) => group.id === selectedGroupId) ?? project.groups[0]
-  $: selectedAttempt = project.attempts.find((attempt) => attempt.id === selectedAttemptId) ?? project.attempts.at(-1)
+  // ---- 版本与选中态派生 ----
+  $: currentVersion = project.versions.find((version) => version.id === project.currentVersionId) ?? project.versions[project.versions.length - 1]
+  $: selectedAttempt = project.attempts.find((attempt) => attempt.id === selectedAttemptId)
+  $: contextVersion = pinnedVersionId
+    ? project.versions.find((version) => version.id === pinnedVersionId) ?? currentVersion
+    : selectedAttempt
+      ? project.versions.find((version) => version.id === selectedAttempt.versionId) ?? currentVersion
+      : currentVersion
+  // 历史版本的句子、意群文本与顺序只读；只有当前草稿能做结构性编辑。
+  $: readOnly = contextVersion.id !== project.currentVersionId
+  $: selectedGroup = contextVersion?.groups.find((group) => group.id === selectedGroupId) ?? contextVersion?.groups[0]
+  $: if (contextVersion && !contextVersion.groups.some((group) => group.id === selectedGroupId)) selectedGroupId = contextVersion.groups[0]?.id ?? ''
   $: selectedScore = selectedAttempt && selectedGroup ? selectedAttempt.scores.find((score) => score.groupId === selectedGroup?.id) : undefined
-  $: completedAttempts = Math.min(project.attempts.length, project.targetAttempts)
+
+  function attemptsOf(version: PracticeVersion): Attempt[] {
+    return version.attemptIds
+      .map((id) => project.attempts.find((attempt) => attempt.id === id))
+      .filter((attempt): attempt is Attempt => Boolean(attempt))
+  }
+  function versionNumberOf(versionId: string): number {
+    return project.versions.find((version) => version.id === versionId)?.number ?? 0
+  }
+
+  $: currentAttempts = attemptsOf(currentVersion)
+  $: completedAttempts = Math.min(currentAttempts.length, project.targetAttempts)
   $: progress = Math.round((completedAttempts / Math.max(project.targetAttempts, 1)) * 100)
   $: averageAccuracy = selectedAttempt?.scores.length ? Math.round(selectedAttempt.scores.reduce((sum, score) => sum + score.accuracy, 0) / selectedAttempt.scores.length) : 0
   $: averageDeviation = selectedAttempt?.scores.length ? Math.round(selectedAttempt.scores.reduce((sum, score) => sum + score.deviation, 0) / selectedAttempt.scores.length) : 0
+  $: allScores = project.attempts.flatMap((attempt) => attempt.scores)
+  $: overallAccuracy = allScores.length ? Math.round(allScores.reduce((sum, score) => sum + score.accuracy, 0) / allScores.length) : 0
+  $: overallDeviation = allScores.length ? Math.round(allScores.reduce((sum, score) => sum + score.deviation, 0) / allScores.length) : 0
+  $: totalIssueCount = project.attempts.flatMap((attempt) => attempt.wordIssues).length
   $: totalIssueCategories = project.errorCategories.map((category) => ({ category, count: project.attempts.flatMap((attempt) => attempt.wordIssues).filter((issue) => issue.category === category).length }))
+  $: versionStats = project.versions.map((version) => {
+    const attempts = attemptsOf(version)
+    const scores = attempts.flatMap((attempt) => attempt.scores)
+    return {
+      version,
+      attempts,
+      groups: version.groups.length,
+      issueCount: attempts.flatMap((attempt) => attempt.wordIssues).length,
+      accuracy: scores.length ? Math.round(scores.reduce((sum, score) => sum + score.accuracy, 0) / scores.length) : 0,
+      frozenAt: version.frozenAt ? new Date(version.frozenAt).toLocaleString('zh-CN') : ''
+    }
+  })
 
   const clone = <T,>(value: T): T => structuredClone(value)
   const uid = (prefix: string) => `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`
 
+  function pushHistory(before: PracticeProject) {
+    undoStack = [...undoStack.slice(-59), before]
+    redoStack = []
+  }
+
+  /** 尝试级编辑（评分、回听范围、错词、反馈、自评、分类等）不产生新版本。 */
   function editProject(mutator: (draft: PracticeProject) => void) {
     const before = clone(project)
     const draft = clone(project)
     mutator(draft)
     draft.updatedAt = new Date().toISOString()
     project = draft
-    undoStack = [...undoStack.slice(-59), before]
-    redoStack = []
+    pushHistory(before)
+    scheduleSave()
+  }
+
+  /**
+   * 句子或意群的结构性编辑：编辑前冻结当前稿，新改动写入新草稿；
+   * 旧尝试永远挂在冻结版本上，按当时的文本、意群顺序和回听范围回看，不会串段。
+   */
+  function editStructure(note: string, mutator: (version: PracticeVersion) => void) {
+    if (readOnly) return
+    const before = clone(project)
+    const { project: next, draftId } = forkForEdit(project, note, mutator)
+    project = next
+    pinnedVersionId = null
+    if (selectedAttemptId && project.attempts.find((attempt) => attempt.id === selectedAttemptId)?.versionId !== draftId) {
+      selectedAttemptId = ''
+    }
+    pushHistory(before)
     scheduleSave()
   }
 
@@ -75,11 +135,23 @@
     }, 250)
   }
 
+  function normalizeSelection() {
+    const current = project.versions.find((version) => version.id === project.currentVersionId) ?? project.versions[0]
+    if (!current) return
+    if (pinnedVersionId && !project.versions.some((version) => version.id === pinnedVersionId)) pinnedVersionId = null
+    const selected = project.attempts.find((attempt) => attempt.id === selectedAttemptId)
+    if (selectedAttemptId && !selected) selectedAttemptId = ''
+    const contextId = pinnedVersionId ?? selected?.versionId ?? current.id
+    const context = project.versions.find((version) => version.id === contextId) ?? current
+    if (!context.groups.some((group) => group.id === selectedGroupId)) selectedGroupId = context.groups[0]?.id ?? ''
+  }
+
   function undo() {
     const target = undoStack.pop()
     if (!target) return
     redoStack = [...redoStack, clone(project)]
     project = target
+    normalizeSelection()
     scheduleSave()
   }
 
@@ -88,6 +160,7 @@
     if (!target) return
     undoStack = [...undoStack, clone(project)]
     project = target
+    normalizeSelection()
     scheduleSave()
   }
 
@@ -96,9 +169,60 @@
     stopPlayback()
   }
 
+  function selectAttempt(attemptId: string) {
+    selectedAttemptId = attemptId
+    pinnedVersionId = null
+    stopPlayback()
+  }
+
+  /** 回看某个历史版本：有尝试则选中最后一轮，没有尝试则固定展示该版本意群。 */
+  function viewVersion(version: PracticeVersion) {
+    stopPlayback()
+    const attempts = attemptsOf(version)
+    if (attempts.length) {
+      pinnedVersionId = null
+      selectedAttemptId = attempts[attempts.length - 1].id
+    } else {
+      pinnedVersionId = version.id
+      selectedAttemptId = ''
+    }
+    selectedGroupId = version.groups[0]?.id ?? ''
+  }
+
+  function backToCurrentDraft() {
+    stopPlayback()
+    pinnedVersionId = null
+    selectedAttemptId = currentAttempts.at(-1)?.id ?? ''
+    selectedGroupId = currentVersion.groups[0]?.id ?? ''
+  }
+
+  /**
+   * 恢复历史版本：冻结当前稿，再按所选版本的句子与意群克隆出一个全新的草稿；
+   * 原历史版本保持不动、可追溯，新一轮录音与尝试计入新草稿。
+   */
+  function restoreVersion(source: PracticeVersion) {
+    if (source.id === project.currentVersionId) {
+      backToCurrentDraft()
+      return
+    }
+    if (!confirm(`将以 v${source.number} 的句子和意群生成一份新草稿，原历史版本会保留。旧尝试仍归属原版本，不并入新稿。确定恢复吗？`)) return
+    stopPlayback()
+    const before = clone(project)
+    const next = restoreAsDraft(project, source.id)
+    const target = next.versions.find((version) => version.id === next.currentVersionId)
+    project = next
+    undoStack = [...undoStack.slice(-59), before]
+    redoStack = []
+    pinnedVersionId = null
+    selectedAttemptId = ''
+    selectedGroupId = target?.groups[0]?.id ?? ''
+    saveStatus = `已从 v${source.number} 生成新草稿 v${target?.number ?? ''}`
+    scheduleSave()
+  }
+
   function updateGroup(field: keyof SenseGroup, value: string | number | string[]) {
-    editProject((draft) => {
-      const group = draft.groups.find((item) => item.id === selectedGroupId)
+    editStructure('调整意群标注', (version) => {
+      const group = version.groups.find((item) => item.id === selectedGroupId)
       if (!group) return
       ;(group as unknown as Record<string, unknown>)[field] = value
     })
@@ -113,60 +237,62 @@
   }
 
   function toggleStressWord(word: string) {
-    if (!selectedGroup) return
+    if (readOnly || !selectedGroup) return
     const words = selectedGroup.stressWords.includes(word) ? selectedGroup.stressWords.filter((item) => item !== word) : [...selectedGroup.stressWords, word]
     updateGroup('stressWords', words)
   }
 
   function addGroup() {
     const id = uid('group')
-    editProject((draft) => {
-      draft.groups.push({ id, text: '新的意群', stressWords: [], stressLevel: 1, pauseMs: 300, intonation: 'flat', note: '' })
+    editStructure('新增意群', (version) => {
+      version.groups.push({ id, text: '新的意群', stressWords: [], stressLevel: 1, pauseMs: 300, intonation: 'flat', note: '' })
     })
     selectedGroupId = id
   }
 
   function deleteGroup() {
-    if (!selectedGroup || project.groups.length <= 1) return
-    const index = project.groups.findIndex((group) => group.id === selectedGroup.id)
-    editProject((draft) => { draft.groups = draft.groups.filter((group) => group.id !== selectedGroup?.id) })
-    selectedGroupId = project.groups[Math.max(0, index - 1)]?.id ?? ''
+    if (readOnly || !selectedGroup || contextVersion.groups.length <= 1) return
+    const index = contextVersion.groups.findIndex((group) => group.id === selectedGroup.id)
+    editStructure('删除意群', (version) => { version.groups = version.groups.filter((group) => group.id !== selectedGroup?.id) })
+    const current = project.versions.find((version) => version.id === project.currentVersionId)
+    selectedGroupId = current?.groups[Math.max(0, index - 1)]?.id ?? current?.groups[0]?.id ?? ''
   }
 
   function moveGroup(direction: -1 | 1) {
-    if (!selectedGroup) return
-    const index = project.groups.findIndex((group) => group.id === selectedGroup?.id)
+    if (readOnly || !selectedGroup) return
+    const index = contextVersion.groups.findIndex((group) => group.id === selectedGroup?.id)
     const next = index + direction
-    if (next < 0 || next >= project.groups.length) return
-    editProject((draft) => {
-      const [group] = draft.groups.splice(index, 1)
-      draft.groups.splice(next, 0, group)
+    if (next < 0 || next >= contextVersion.groups.length) return
+    editStructure('调整意群顺序', (version) => {
+      const [group] = version.groups.splice(index, 1)
+      version.groups.splice(next, 0, group)
     })
   }
 
   function splitSentence() {
-    const parts = project.sentence.split(/[，。！？；、\n]+/).map((part) => part.trim()).filter(Boolean)
+    if (readOnly) return
+    const parts = currentVersion.sentence.split(/[，。！？；、\n]+/).map((part) => part.trim()).filter(Boolean)
     if (parts.length < 2) return
-    editProject((draft) => {
-      draft.groups = parts.map((text, index) => ({
-        id: draft.groups[index]?.id ?? uid('group'),
+    editStructure('按标点切分意群', (version) => {
+      version.groups = parts.map((text, index) => ({
+        id: version.groups[index]?.id ?? uid('group'),
         text,
-        stressWords: draft.groups[index]?.stressWords ?? [],
-        stressLevel: draft.groups[index]?.stressLevel ?? 1,
-        pauseMs: draft.groups[index]?.pauseMs ?? 300,
-        intonation: draft.groups[index]?.intonation ?? 'flat',
-        note: draft.groups[index]?.note ?? ''
+        stressWords: version.groups[index]?.stressWords ?? [],
+        stressLevel: version.groups[index]?.stressLevel ?? 1,
+        pauseMs: version.groups[index]?.pauseMs ?? 300,
+        intonation: version.groups[index]?.intonation ?? 'flat',
+        note: version.groups[index]?.note ?? ''
       }))
     })
-    selectedGroupId = project.groups[0]?.id ?? ''
+    selectedGroupId = project.versions.find((version) => version.id === project.currentVersionId)?.groups[0]?.id ?? ''
   }
 
   function updateSentence(value: string) {
-    editProject((draft) => { draft.sentence = value })
+    editStructure('编辑原句', (version) => { version.sentence = value })
   }
 
   async function startRecording() {
-    if (recording) return
+    if (recording || readOnly) return
     recordingFallback = false
     mediaChunks = []
     try {
@@ -201,10 +327,14 @@
     mediaRecorder = null
     const blob = !simulated && mediaChunks.length ? new Blob(mediaChunks, { type: mediaChunks[0].type || 'audio/webm' }) : undefined
     const attemptId = uid('attempt')
-    const number = project.attempts.length + 1
+    const version = project.versions.find((item) => item.id === project.currentVersionId)
+    if (!version) return
+    // 尝试编号在版本内递增；新版本重新从第 1 轮开始。
+    const number = version.attemptIds.length + 1
     const duration = Number(Math.max(0.5, recordingSeconds).toFixed(1))
     const attempt: Attempt = {
       id: attemptId,
+      versionId: version.id,
       number,
       label: simulated ? `第 ${number} 轮 · 离线模拟` : `第 ${number} 轮`,
       createdAt: new Date().toISOString(),
@@ -214,14 +344,18 @@
       simulated,
       rangeStart: 0,
       rangeEnd: duration,
-      scores: project.groups.map((group) => ({ groupId: group.id, accuracy: 70, rhythm: 70, deviation: 0, note: '' })),
+      scores: version.groups.map((group) => ({ groupId: group.id, accuracy: 70, rhythm: 70, deviation: 0, note: '' })),
       wordIssues: [],
       feedback: [],
       selfNote: ''
     }
     if (blob) audioUrls.set(attemptId, URL.createObjectURL(blob))
-    editProject((draft) => { draft.attempts.push(attempt) })
+    editProject((draft) => {
+      draft.attempts.push(attempt)
+      draft.versions.find((item) => item.id === draft.currentVersionId)?.attemptIds.push(attemptId)
+    })
     selectedAttemptId = attemptId
+    pinnedVersionId = null
     workspaceTab = 'review'
     recordingSeconds = duration
   }
@@ -309,7 +443,7 @@
   }
 
   function addFeedback() {
-    if (!selectedGroup || !feedbackText.trim()) return
+    if (!selectedGroup || !selectedAttempt || !feedbackText.trim()) return
     editProject((draft) => {
       const attempt = draft.attempts.find((item) => item.id === selectedAttemptId)
       attempt?.feedback.push({
@@ -323,6 +457,7 @@
     feedbackText = ''
   }
 
+  // 回听范围保存在每一轮尝试上，即使之后意群被改动，旧尝试仍按当时标记的范围播放。
   function updateRange(field: 'rangeStart' | 'rangeEnd', value: number) {
     if (!selectedAttempt) return
     editProject((draft) => {
@@ -343,23 +478,30 @@
   }
 
   function resetSample() {
-    if (!confirm('恢复示例会替换当前练习，确定继续吗？')) return
-    editProject((draft) => { Object.assign(draft, clone(createSampleProject())) })
-    selectedGroupId = project.groups[0]?.id ?? ''
-    selectedAttemptId = project.attempts.at(-1)?.id ?? ''
+    if (!confirm('恢复示例会替换当前练习的全部版本、尝试与录音，确定继续吗？')) return
+    const sample = createSampleProject()
+    project = sample
+    pinnedVersionId = null
+    selectedGroupId = sample.versions[0]?.groups[0]?.id ?? ''
+    selectedAttemptId = sample.attempts.at(-1)?.id ?? ''
+    undoStack = []
+    redoStack = []
+    scheduleSave()
   }
 
   async function deleteAllData() {
-    if (!confirm('这会清除本机全部练习、录音与反馈，且不能撤销。')) return
+    if (!confirm('这会清除本机全部版本、尝试、录音与反馈，且不能撤销。')) return
     stopPlayback()
     await clearPractice()
     const sample = createSampleProject()
     project = sample
-    selectedGroupId = sample.groups[0]?.id ?? ''
+    pinnedVersionId = null
+    selectedGroupId = sample.versions[0]?.groups[0]?.id ?? ''
     selectedAttemptId = sample.attempts.at(-1)?.id ?? ''
     undoStack = []
     redoStack = []
     await savePractice(project)
+    saveStatus = '本机数据已清除'
   }
 
   function onKeydown(event: KeyboardEvent) {
@@ -375,26 +517,28 @@
       redo()
     } else if (event.altKey && event.key.toLowerCase() === 'r') {
       event.preventDefault()
-      recording ? stopRecording() : void startRecording()
+      if (!readOnly) recording ? stopRecording() : void startRecording()
     } else if (event.altKey && (event.key === 'ArrowUp' || event.key === 'ArrowDown')) {
       event.preventDefault()
       moveGroup(event.key === 'ArrowUp' ? -1 : 1)
     } else if (event.key === 'ArrowLeft' || event.key === 'ArrowRight') {
       if (event.target instanceof HTMLInputElement || event.target instanceof HTMLTextAreaElement || event.target instanceof HTMLSelectElement) return
-      const index = project.groups.findIndex((group) => group.id === selectedGroupId)
+      const index = contextVersion.groups.findIndex((group) => group.id === selectedGroupId)
       const next = index + (event.key === 'ArrowLeft' ? -1 : 1)
-      if (project.groups[next]) selectedGroupId = project.groups[next].id
+      if (contextVersion.groups[next]) selectedGroupId = contextVersion.groups[next].id
     }
   }
 
   onMount(async () => {
     online = navigator.onLine
     const saved = await loadPractice()
-    if (saved) project = saved
-    selectedGroupId = project.groups[0]?.id ?? ''
-    selectedAttemptId = project.attempts.at(-1)?.id ?? ''
+    if (saved) project = saved.project
+    pinnedVersionId = null
+    const current = project.versions.find((version) => version.id === project.currentVersionId) ?? project.versions[0]
+    selectedGroupId = current?.groups[0]?.id ?? ''
+    selectedAttemptId = current ? attemptsOf(current).at(-1)?.id ?? '' : ''
     loaded = true
-    saveStatus = saved ? '已恢复本机练习' : '示例练习已就绪'
+    saveStatus = saved ? (saved.migrated ? '已无损迁移旧练习到版本模式' : '已恢复本机练习') : '示例练习已就绪'
     window.addEventListener('online', () => { online = true })
     window.addEventListener('offline', () => { online = false })
     window.addEventListener('keydown', onKeydown)
@@ -425,7 +569,7 @@
     </div>
     <div class="practice-title">
       <h1>{project.title}</h1>
-      <span>{project.teacher} · 手机与电脑自动适配</span>
+      <span>{project.teacher} · 当前草稿 v{currentVersion.number} · 共 {project.versions.length} 个版本</span>
     </div>
     <div class="header-actions">
       <span class:offline={!online} class="connection badge">{online ? '在线' : '离线编辑'}</span>
@@ -438,12 +582,12 @@
 
   <section class="progress-strip">
     <div class="progress-copy">
-      <span>练习进度</span>
+      <span>当前稿进度（v{currentVersion.number}）</span>
       <strong>{completedAttempts} / {project.targetAttempts} 轮</strong>
     </div>
     <ProgressBar value={progress} />
-    <div class="progress-metric"><span>当前准确度</span><strong>{averageAccuracy}%</strong></div>
-    <div class="progress-metric"><span>平均偏差</span><strong>{averageDeviation}%</strong></div>
+    <div class="progress-metric"><span>查看尝试准确度</span><strong>{averageAccuracy}%</strong></div>
+    <div class="progress-metric"><span>查看尝试偏差</span><strong>{averageDeviation}%</strong></div>
     <div class="progress-metric"><span>目标时长</span><strong>{project.targetDuration.toFixed(1)}s</strong></div>
   </section>
 
@@ -457,22 +601,36 @@
     <aside class:mobile-hidden={workspaceTab !== 'annotate'} class="group-column card">
       <div class="section-heading">
         <div><span class="eyebrow">TEXT</span><h2>原文与意群</h2></div>
-        <button class="btn btn-sm variant-soft-primary" on:click={addGroup}>＋ 意群</button>
+        {#if !readOnly}
+          <button class="btn btn-sm variant-soft-primary" on:click={addGroup}>＋ 意群</button>
+        {:else}
+          <span class="badge version-badge-history">历史 v{contextVersion.number}</span>
+        {/if}
       </div>
+      {#if readOnly}
+        <div class="lock-banner">
+          <strong>正在回看 v{contextVersion.number}（{contextVersion.note || '历史版本'}）</strong>
+          <p>该版本已冻结，意群文本与顺序保持当时的样子，改动不会串到旧尝试上。</p>
+          <div class="inline-actions">
+            <button class="btn btn-sm variant-filled-primary" on:click={backToCurrentDraft}>回到当前稿 v{currentVersion.number}</button>
+            <button class="btn btn-sm variant-soft" on:click={() => restoreVersion(contextVersion)}>恢复为新稿</button>
+          </div>
+        </div>
+      {/if}
       <label class="label">
-        <span>录入句子</span>
-        <textarea class="textarea" rows="4" value={project.sentence} on:input={(event) => updateSentence(event.currentTarget.value)}></textarea>
+        <span>录入句子{readOnly ? '（只读）' : ''}</span>
+        <textarea class="textarea" rows="4" value={contextVersion.sentence} disabled={readOnly} on:input={(event) => updateSentence(event.currentTarget.value)}></textarea>
       </label>
       <label class="label">
         <span>英文释义 / 参考</span>
         <textarea class="textarea" rows="3" value={project.translation} on:input={(event) => editProject((draft) => draft.translation = event.currentTarget.value)}></textarea>
       </label>
       <div class="inline-actions">
-        <button class="btn btn-sm variant-soft" on:click={splitSentence}>按标点智能切分</button>
-        <span>{project.groups.length} 个意群</span>
+        <button class="btn btn-sm variant-soft" disabled={readOnly} on:click={splitSentence}>按标点智能切分</button>
+        <span>{contextVersion.groups.length} 个意群</span>
       </div>
       <div class="group-list">
-        {#each project.groups as group, index (group.id)}
+        {#each contextVersion.groups as group, index (group.id)}
           <button class:active={group.id === selectedGroup?.id} class="group-item" on:click={() => selectGroup(group.id)}>
             <span class="group-index">{String(index + 1).padStart(2, '0')}</span>
             <span class="group-copy">
@@ -482,15 +640,18 @@
           </button>
         {/each}
       </div>
-      <div class="sidebar-actions">
-        <button class="btn btn-sm variant-ghost" on:click={() => moveGroup(-1)}>上移</button>
-        <button class="btn btn-sm variant-ghost" on:click={() => moveGroup(1)}>下移</button>
-        <button class="btn btn-sm variant-ghost text-error-500" on:click={deleteGroup}>删除意群</button>
-      </div>
+      {#if !readOnly}
+        <div class="sidebar-actions">
+          <button class="btn btn-sm variant-ghost" on:click={() => moveGroup(-1)}>上移</button>
+          <button class="btn btn-sm variant-ghost" on:click={() => moveGroup(1)}>下移</button>
+          <button class="btn btn-sm variant-ghost text-error-500" on:click={deleteGroup}>删除意群</button>
+        </div>
+      {/if}
       <div class="shortcut-note">
-        <strong>快捷操作</strong>
-        <span>Alt + ↑/↓ 调整意群 · Alt+R 开始/停止录音</span>
-        <span>← / → 切换意群 · ⌘S 保存 · ⌘Z 撤销</span>
+        <strong>版本工作流</strong>
+        <span>改句子或意群前会自动冻结当前稿，旧尝试按当时版本回看。</span>
+        <span>恢复历史版本会生成新草稿，原版本保留可追溯。</span>
+        <span>Alt + ↑/↓ 调序 · Alt+R 录音 · ← / → 切意群 · ⌘S 保存 · ⌘Z 撤销</span>
       </div>
     </aside>
 
@@ -499,52 +660,58 @@
         <div class="card annotation-card">
           <div class="section-heading">
             <div><span class="eyebrow">PROSODY MARKUP</span><h2>发音与韵律标注</h2></div>
-            <span class="chapter-badge">意群 {project.groups.findIndex((group) => group.id === selectedGroup?.id) + 1}</span>
+            <span class="chapter-badge">{readOnly ? `v${contextVersion.number} 只读 · ` : ''}意群 {contextVersion.groups.findIndex((group) => group.id === selectedGroup?.id) + 1}</span>
           </div>
+          {#if readOnly}
+            <div class="lock-banner compact">
+              <strong>历史版本只读</strong>
+              <p>评分、错词和教师反馈仍可在右侧该轮尝试上补充；要改文字请恢复为新稿。</p>
+            </div>
+          {/if}
           <label class="label">
             <span>意群文本</span>
-            <input class="input" value={selectedGroup.text} on:input={(event) => updateGroup('text', event.currentTarget.value)} />
+            <input class="input" value={selectedGroup.text} disabled={readOnly} on:input={(event) => updateGroup('text', event.currentTarget.value)} />
           </label>
           <div class="token-board">
-            <div class="token-label">点击文字切换重音词</div>
+            <div class="token-label">点击文字切换重音词{readOnly ? '（历史版本只读）' : ''}</div>
             <div class="token-list">
               {#each selectedGroup.text.split('') as char}
-                <button class:stressed={selectedGroup.stressWords.some((word) => word.includes(char))} class="text-token" on:click={() => toggleStressWord(char)}>{char}</button>
+                <button class:stressed={selectedGroup.stressWords.some((word) => word.includes(char))} class="text-token" disabled={readOnly} on:click={() => toggleStressWord(char)}>{char}</button>
               {/each}
             </div>
           </div>
           <div class="annotation-grid">
             <label class="label">
               <span>重音词（用逗号分隔）</span>
-              <input class="input" value={selectedGroup.stressWords.join('，')} on:change={(event) => updateGroup('stressWords', event.currentTarget.value.split(/[，,]/).map((word) => word.trim()).filter(Boolean))} />
+              <input class="input" value={selectedGroup.stressWords.join('，')} disabled={readOnly} on:change={(event) => updateGroup('stressWords', event.currentTarget.value.split(/[，,]/).map((word) => word.trim()).filter(Boolean))} />
             </label>
             <div class="label">
               <span>重音强度</span>
               <div class="segmented">
                 {#each [0, 1, 2, 3] as level}
-                  <button class:active={selectedGroup.stressLevel === level} on:click={() => setStressLevel(level)}>{level === 0 ? '无' : '●'.repeat(level)}</button>
+                  <button class:active={selectedGroup.stressLevel === level} disabled={readOnly} on:click={() => setStressLevel(level)}>{level === 0 ? '无' : '●'.repeat(level)}</button>
                 {/each}
               </div>
             </div>
             <label class="label">
               <span>后接停顿：{selectedGroup.pauseMs}ms</span>
-              <input class="range" type="range" min="0" max="1500" step="20" value={selectedGroup.pauseMs} on:input={(event) => updateGroup('pauseMs', Number(event.currentTarget.value))} />
+              <input class="range" type="range" min="0" max="1500" step="20" value={selectedGroup.pauseMs} disabled={readOnly} on:input={(event) => updateGroup('pauseMs', Number(event.currentTarget.value))} />
             </label>
             <label class="label">
               <span>语调走向</span>
-              <select class="select" value={selectedGroup.intonation} on:change={(event) => setIntonation(event.currentTarget.value)}>
+              <select class="select" value={selectedGroup.intonation} disabled={readOnly} on:change={(event) => setIntonation(event.currentTarget.value)}>
                 {#each intonationOptions as option}<option value={option.value}>{option.label}</option>{/each}
               </select>
             </label>
             <label class="label span-2">
               <span>学习提示</span>
-              <input class="input" value={selectedGroup.note} on:input={(event) => updateGroup('note', event.currentTarget.value)} placeholder="例如：重音后短停，句尾自然下落" />
+              <input class="input" value={selectedGroup.note} disabled={readOnly} on:input={(event) => updateGroup('note', event.currentTarget.value)} placeholder="例如：重音后短停，句尾自然下落" />
             </label>
           </div>
           <div class="prosody-preview">
             <div>
               <span class="eyebrow">PREVIEW</span>
-              <strong>标注预览</strong>
+              <strong>标注预览 · v{contextVersion.number}</strong>
             </div>
             <p>
               <span class="stress-line">{'●'.repeat(selectedGroup.stressLevel)}</span>
@@ -555,36 +722,64 @@
           </div>
         </div>
 
-        <div class="card recorder-card">
-          <div class="section-heading">
-            <div><span class="eyebrow">RECORDING</span><h2>录下这一轮</h2></div>
-            <span class:recording class="record-dot">{recording ? 'REC' : 'READY'}</span>
-          </div>
-          <div class="record-console">
-            <div class="record-time">{Math.floor(recordingSeconds / 60).toString().padStart(2, '0')}:{Math.floor(recordingSeconds % 60).toString().padStart(2, '0')}.{Math.floor((recordingSeconds % 1) * 10)}</div>
-            <div class="level-bars" aria-hidden="true">
-              {#each Array(24) as _, index}<span style={`height:${recording ? 18 + ((index * 17) % 46) : 12}%`}></span>{/each}
+        {#if !readOnly}
+          <div class="card recorder-card">
+            <div class="section-heading">
+              <div><span class="eyebrow">RECORDING</span><h2>录下这一轮（计入 v{currentVersion.number}）</h2></div>
+              <span class:recording class="record-dot">{recording ? 'REC' : 'READY'}</span>
             </div>
-            <button class:variant-filled-error={recording} class:variant-filled-primary={!recording} class="btn record-button" on:click={() => recording ? stopRecording() : startRecording()}>
-              {recording ? '■ 停止并保存尝试' : '● 开始录音'}
-            </button>
-            <p>{recordingFallback ? '当前浏览器未授权麦克风，将保存一轮可校对的离线模拟记录。' : '录音仅保存在当前设备 IndexedDB，不会上传。'}</p>
+            <div class="record-console">
+              <div class="record-time">{Math.floor(recordingSeconds / 60).toString().padStart(2, '0')}:{Math.floor(recordingSeconds % 60).toString().padStart(2, '0')}.{Math.floor((recordingSeconds % 1) * 10)}</div>
+              <div class="level-bars" aria-hidden="true">
+                {#each Array(24) as _, index}<span style={`height:${recording ? 18 + ((index * 17) % 46) : 12}%`}></span>{/each}
+              </div>
+              <button class:variant-filled-error={recording} class:variant-filled-primary={!recording} class="btn record-button" on:click={() => recording ? stopRecording() : startRecording()}>
+                {recording ? '■ 停止并保存尝试' : '● 开始录音'}
+              </button>
+              <p>{recordingFallback ? '当前浏览器未授权麦克风，将保存一轮可校对的离线模拟记录。' : '录音仅保存在当前设备 IndexedDB，不会上传。'}</p>
+            </div>
           </div>
-        </div>
+        {/if}
       </section>
     {/if}
 
     <aside class:mobile-hidden={workspaceTab !== 'review' && workspaceTab !== 'progress'} class="review-column">
+      <div class="card versions-card">
+        <div class="section-heading">
+          <div><span class="eyebrow">VERSIONS</span><h2>版本历史</h2></div>
+          <span class="chapter-badge">{project.versions.length} 个版本</span>
+        </div>
+        <div class="version-list">
+          {#each [...versionStats].reverse() as stat}
+            <div class:active={stat.version.id === contextVersion.id} class:draft={stat.version.isDraft} class="version-item">
+              <button class="version-main" on:click={() => viewVersion(stat.version)}>
+                <span class="version-name">
+                  <strong>v{stat.version.number}</strong>
+                  {#if stat.version.isDraft}<span class="badge version-badge-draft">当前草稿</span>{:else}<span class="badge version-badge-history">历史版本</span>{/if}
+                </span>
+                <span class="version-meta">
+                  <small>{stat.version.note || '未命名版本'} · {stat.version.groups.length} 意群</small>
+                  <small>{stat.attempts.length} 次尝试 · {stat.issueCount} 个错词{stat.frozenAt ? ` · 冻结于 ${stat.frozenAt}` : ''}</small>
+                </span>
+              </button>
+              {#if !stat.version.isDraft}
+                <button class="btn btn-sm variant-soft version-restore" on:click={() => restoreVersion(stat.version)}>恢复为新稿</button>
+              {/if}
+            </div>
+          {/each}
+        </div>
+      </div>
+
       <div class="card attempts-card">
         <div class="section-heading">
           <div><span class="eyebrow">TAKES</span><h2>多轮尝试</h2></div>
-          <span class="chapter-badge">{project.attempts.length} 轮</span>
+          <span class="chapter-badge">{project.attempts.length} 轮 · {project.versions.length} 版本</span>
         </div>
         <div class="attempt-list">
           {#each [...project.attempts].reverse() as attempt}
-            <button class:active={attempt.id === selectedAttempt?.id} class="attempt-item" on:click={() => { selectedAttemptId = attempt.id; stopPlayback() }}>
+            <button class:active={attempt.id === selectedAttempt?.id} class="attempt-item" on:click={() => selectAttempt(attempt.id)}>
               <span class="attempt-number">{attempt.number}</span>
-              <span><strong>{attempt.label}</strong><small>{attempt.duration.toFixed(1)}s · {attempt.simulated ? '模拟' : '录音'}</small></span>
+              <span><strong>{attempt.label}</strong><small>v{versionNumberOf(attempt.versionId)} · {attempt.duration.toFixed(1)}s · {attempt.simulated ? '模拟' : '录音'}</small></span>
               <span class="attempt-score">{attempt.scores.length ? Math.round(attempt.scores.reduce((sum, score) => sum + score.accuracy, 0) / attempt.scores.length) : 0}%</span>
             </button>
           {/each}
@@ -594,7 +789,10 @@
       {#if selectedAttempt}
         <div class:recommended={workspaceTab !== 'progress'} class="card playback-card">
           <div class="section-heading">
-            <div><span class="eyebrow">COMPARE</span><h2>回听与偏差</h2></div>
+            <div>
+              <span class="eyebrow">COMPARE</span>
+              <h2>回听与偏差 <span class="badge version-badge-history">v{versionNumberOf(selectedAttempt.versionId)}</span></h2>
+            </div>
             <button class="btn btn-sm variant-filled-primary" on:click={togglePlayback}>{playing ? '■ 停止' : '▶ 播放范围'}</button>
           </div>
           <audio bind:this={audioElement} src={audioUrlFor(selectedAttempt)} on:timeupdate={onAudioTimeUpdate} on:ended={stopPlayback}></audio>
@@ -647,17 +845,21 @@
         <div class="section-heading">
           <div><span class="eyebrow">TEACHER FEEDBACK</span><h2>逐段反馈</h2></div>
         </div>
-        <div class="feedback-list">
-          {#each selectedAttempt?.feedback.filter((item) => item.groupId === selectedGroupId) ?? [] as feedback}
-            <div class="feedback-item">
-              <strong>{feedback.teacher}</strong>
-              <p>{feedback.text}</p>
-              <small>{new Date(feedback.createdAt).toLocaleString('zh-CN')}</small>
-            </div>
-          {/each}
-        </div>
-        <label class="label"><span>给当前意群留言</span><textarea class="textarea" rows="2" value={feedbackText} on:input={(event) => feedbackText = event.currentTarget.value} placeholder="教师反馈会绑定到这一轮和这个意群"></textarea></label>
-        <button class="btn btn-sm variant-filled-tertiary" on:click={addFeedback}>留下反馈</button>
+        {#if selectedAttempt}
+          <div class="feedback-list">
+            {#each selectedAttempt.feedback.filter((item) => item.groupId === selectedGroupId) ?? [] as feedback}
+              <div class="feedback-item">
+                <strong>{feedback.teacher}</strong>
+                <p>{feedback.text}</p>
+                <small>{new Date(feedback.createdAt).toLocaleString('zh-CN')}</small>
+              </div>
+            {/each}
+          </div>
+          <label class="label"><span>给当前意群留言</span><textarea class="textarea" rows="2" value={feedbackText} on:input={(event) => feedbackText = event.currentTarget.value} placeholder="教师反馈会绑定到这一轮和这个意群"></textarea></label>
+          <button class="btn btn-sm variant-filled-tertiary" on:click={addFeedback}>留下反馈</button>
+        {:else}
+          <p class="empty-copy">从上方选择一轮尝试后查看或补充逐段反馈。</p>
+        {/if}
       </div>
     </aside>
 
@@ -667,11 +869,34 @@
           <div><span class="eyebrow">PROGRESS</span><h2>练习进度与错词归类</h2></div>
         </div>
         <div class="progress-grid">
-          <div><strong>{project.attempts.length}</strong><span>累计尝试</span></div>
-          <div><strong>{averageAccuracy}%</strong><span>当前准确度</span></div>
-          <div><strong>{averageDeviation}%</strong><span>平均偏差</span></div>
-          <div><strong>{project.errorCategories.reduce((sum, category) => sum + project.attempts.flatMap((attempt) => attempt.wordIssues).filter((issue) => issue.category === category).length, 0)}</strong><span>错词记录</span></div>
+          <div><strong>{project.attempts.length}</strong><span>累计尝试（全部版本）</span></div>
+          <div><strong>{currentAttempts.length}</strong><span>当前稿 v{currentVersion.number} 尝试</span></div>
+          <div><strong>{overallAccuracy}%</strong><span>累计平均准确度</span></div>
+          <div><strong>{totalIssueCount}</strong><span>错词记录（全部版本）</span></div>
         </div>
+
+        <h3 class="table-title">按版本统计</h3>
+        <div class="version-table">
+          <div class="version-row version-row-head">
+            <span>版本</span><span>状态</span><span>意群</span><span>尝试数</span><span>错词总数</span><span>平均准确度</span><span>操作</span>
+          </div>
+          {#each versionStats as stat}
+            <div class="version-row">
+              <span><strong>v{stat.version.number}</strong><small>{stat.version.note || '未命名版本'}</small></span>
+              <span>{stat.version.isDraft ? '当前草稿' : '历史版本'}</span>
+              <span>{stat.groups}</span>
+              <span>{stat.attempts.length}</span>
+              <span>{stat.issueCount}</span>
+              <span>{stat.accuracy}%</span>
+              <span class="row-actions">
+                <button class="btn btn-sm variant-ghost" on:click={() => viewVersion(stat.version)}>回看</button>
+                {#if !stat.version.isDraft}<button class="btn btn-sm variant-soft" on:click={() => restoreVersion(stat.version)}>恢复为新稿</button>{/if}
+              </span>
+            </div>
+          {/each}
+        </div>
+
+        <h3 class="table-title">错词分类（全部版本）</h3>
         <div class="category-list">
           {#each totalIssueCategories as category}
             <div><span>{category.category}</span><div class="mini-bar"><i style={`width:${Math.min(100, category.count * 18)}%`}></i></div><strong>{category.count}</strong></div>
